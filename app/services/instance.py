@@ -5,6 +5,13 @@ The generator produces the *smallest* value satisfying a normalized node
 a depth budget so recursive schemas terminate. The validator is the same
 constraint set the comparator reasons about; it is used to verify that a
 generated counter-example passes exactly one side.
+
+Call coverage additionally needs a *tri-state* verdict (see
+:func:`coverage_verdict`): every value/node check is classified as
+definitely-passing (``PASS``), definitely-failing (``FAIL``) or undecided
+(``PENDING`` — the verdict hinges on an unsupported keyword, an unresolvable
+``$ref`` or a reference cycle). PENDING is what lets ``oneOf``/``anyOf`` be
+adjudicated per their real semantics instead of optimistically covered.
 """
 from __future__ import annotations
 
@@ -13,6 +20,11 @@ from typing import Any
 from .schemagraph import SchemaNode, UNSET
 
 MAX_DEPTH = 8
+
+# Tri-state coverage verdicts
+PASS = "pass"      # all decidable constraints satisfied, no pending facets
+FAIL = "fail"      # a known constraint is violated
+PENDING = "pending"  # not known to fail, but unsupported constraints decide
 
 
 class ValidationError(Exception):
@@ -56,7 +68,13 @@ def type_allows(node: SchemaNode, value_type: str, value: Any = None) -> bool:
 
 def validate(node: SchemaNode, value: Any, path: str = "",
              depth: int = 0) -> list[str]:
-    """Return a list of validation error messages (empty => valid)."""
+    """Return a list of validation error messages (empty => valid).
+
+    This validator mirrors the constraint set the comparator reasons about;
+    it is deliberately lenient on ``oneOf`` (treats it like ``anyOf``) and
+    optimistic on cycles/unsupported keywords — the strict tri-state
+    semantics needed for call coverage live in :func:`coverage_verdict`.
+    """
     errors: list[str] = []
     if node.is_bool is True:
         return errors
@@ -78,6 +96,42 @@ def validate(node: SchemaNode, value: Any, path: str = "",
 
     if value is None:
         return errors
+
+    errors.extend(_facet_errors(node, value, path))
+
+    if vt == "array" and node.items is not None and depth < MAX_DEPTH:
+        for i, item in enumerate(value):
+            errors.extend(validate(node.items, item,
+                                   f"{path}/{i}", depth + 1))
+
+    if vt == "object":
+        for pname, pnode in node.properties.items():
+            if pname in value and depth < MAX_DEPTH:
+                # request/response filtering at replay time is done by the
+                # caller; raw nodes keep both readOnly/writeOnly facets
+                errors.extend(validate(pnode, value[pname],
+                                       f"{path}/{_esc(pname)}", depth + 1))
+        extra = {k: v for k, v in value.items() if k not in node.properties}
+        if isinstance(node.additional, SchemaNode) and depth < MAX_DEPTH:
+            for k, v in sorted(extra.items()):
+                errors.extend(validate(node.additional, v,
+                                       f"{path}/{_esc(k)}", depth + 1))
+
+        if node.one_of and depth < MAX_DEPTH:
+            if not any(not validate(b, value, path, depth + 1)
+                       for b in node.one_of):
+                errors.append(f"{path or '#'}: 不满足 oneOf 的任何分支")
+        if node.any_of and depth < MAX_DEPTH:
+            if not any(not validate(b, value, path, depth + 1)
+                       for b in node.any_of):
+                errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
+    return errors
+
+
+def _facet_errors(node: SchemaNode, value: Any, path: str = "") -> list[str]:
+    """Non-recursive, known-constraint checks of one node (type pre-checked)."""
+    errors: list[str] = []
+    vt = _json_type(value)
 
     if node.enum is not None:
         if not any(_json_safe_equal(value, e) for e in node.enum):
@@ -110,7 +164,7 @@ def validate(node: SchemaNode, value: Any, path: str = "",
             errors.append(
                 f"{path or '#'}: 字符串长度超过 maxLength {node.max_length}")
 
-    if vt == "array" and node.items is not None and depth < MAX_DEPTH:
+    if vt == "array":
         if node.min_items is not None and len(value) < node.min_items:
             errors.append(
                 f"{path or '#'}: 数组元素少于 minItems {node.min_items}")
@@ -121,9 +175,6 @@ def validate(node: SchemaNode, value: Any, path: str = "",
             seen = [_json_key(v) for v in value]
             if len(set(seen)) != len(seen):
                 errors.append(f"{path or '#'}: 数组元素不唯一")
-        for i, item in enumerate(value):
-            errors.extend(validate(node.items, item,
-                                   f"{path}/{i}", depth + 1))
 
     if vt == "object":
         if node.min_props is not None and len(value) < node.min_props:
@@ -135,29 +186,10 @@ def validate(node: SchemaNode, value: Any, path: str = "",
         for req in node.required:
             if req not in value:
                 errors.append(f"{path or '#'}: 缺少必填属性 {req!r}")
-        for pname, pnode in node.properties.items():
-            if pname in value and depth < MAX_DEPTH:
-                # request/response filtering at replay time is done by the
-                # caller; raw nodes keep both readOnly/writeOnly facets
-                errors.extend(validate(pnode, value[pname],
-                                       f"{path}/{_esc(pname)}", depth + 1))
         extra = {k: v for k, v in value.items() if k not in node.properties}
         if node.additional is False and extra:
             errors.append(
                 f"{path or '#'}: 不允许额外属性 {sorted(extra)}")
-        elif isinstance(node.additional, SchemaNode) and depth < MAX_DEPTH:
-            for k, v in sorted(extra.items()):
-                errors.extend(validate(node.additional, v,
-                                       f"{path}/{_esc(k)}", depth + 1))
-
-    if vt in ("object",) and node.one_of and depth < MAX_DEPTH:
-        if not any(not validate(b, value, path, depth + 1)
-                   for b in node.one_of):
-            errors.append(f"{path or '#'}: 不满足 oneOf 的任何分支")
-    if vt in ("object",) and node.any_of and depth < MAX_DEPTH:
-        if not any(not validate(b, value, path, depth + 1)
-                   for b in node.any_of):
-            errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
     return errors
 
 
@@ -179,58 +211,209 @@ _UNSUPPORTED_KW_TYPES = {
 }
 
 
-def unsupported_along_value(node: SchemaNode, value: Any,
-                            depth: int = 0) -> list:
-    """Unsupported keywords whose skipped constraints decide ``value``'s fate.
+def coverage_verdict(node: SchemaNode, value: Any, path: str = "",
+                     depth: int = 0) -> dict:
+    """Tri-state verdict of ``value`` against ``node`` for call coverage.
 
-    Walks the parsed schema graph *along the actual value* — local ``$ref``
-    (already resolved into the graph), nested properties, array items and
-    ``oneOf``/``anyOf`` branches — and returns ``(keyword, FacetLoc)`` for
-    every unsupported keyword the value's verdict still depends on. Optional
-    properties absent from the value are not visited, and keywords that do
-    not apply to the value's JSON type (e.g. ``pattern`` for an integer) are
-    ignored. For compositions the hits propagate only when *every* branch the
-    value passes relies on unsupported constraints; a single cleanly
-    validated branch makes the verdict solid.
+    Walks the parsed schema graph *along the actual value* (local ``$ref``
+    already resolved into the graph, nested properties, array items and
+    ``oneOf``/``anyOf`` branches) and returns a dict::
+
+        {"state": PASS | FAIL | PENDING,
+         "hits":  [(keyword, FacetLoc), ...]   # unsupported keyword facets
+         "notes": [(text, FacetLoc | None), ...],  # unjudgeable sites
+         "errors": [str, ...]}                 # known-constraint violations
+
+    Branch semantics are exact: each ``oneOf``/``anyOf`` member is itself
+    classified into the three states, then the combination is adjudicated per
+    the JSON Schema meaning of "exactly one" / "at least one":
+
+    * oneOf: exactly one PASS  => PASS;
+      two or more PASS          => FAIL (the "exactly one" contract breaks);
+      no PASS and any PENDING   => PENDING (cannot decide, pending keywords
+                                  and their locations are reported).
+    * anyOf: at least one PASS  => PASS (a cleanly validated branch settles
+               the verdict even if other branches stay pending);
+      no PASS and any PENDING   => PENDING;
+      every branch FAIL         => FAIL.
+
+    Optional properties absent from the value are never visited, and keywords
+    that do not apply to the value's JSON type (e.g. ``pattern`` on an
+    integer) do not make the verdict pending.
     """
     hits: list = []
+    notes: list = []
+    errors: list[str] = []
+
+    def pending():
+        return {"state": PENDING, "hits": hits, "notes": notes,
+                "errors": errors}
+
     if node is None or depth >= MAX_DEPTH:
-        return hits
-    if node.is_bool is not None or node.is_cycle or node.invalid:
-        return hits  # bool/cycle/invalid nodes are reported by the caller
+        return {"state": PASS, "hits": hits, "notes": notes,
+                "errors": errors}
+    if node.is_bool is True:
+        return {"state": PASS, "hits": hits, "notes": notes,
+                "errors": errors}
+    if node.is_bool is False:
+        errors.append(f"{path or '#'}: false 模式不允许任何值")
+        return {"state": FAIL, "hits": hits, "notes": notes,
+                "errors": errors}
+    if node.is_cycle:
+        notes.append(("该取值的约束涉及循环引用，无法判定", node.loc))
+        return pending()
+    if node.invalid:
+        notes.append((f"该取值的约束无法判定（{node.invalid}）", node.loc))
+        return pending()
 
     vt = _json_type(value)
+
+    # unsupported keywords at this node that apply to the value's JSON type
     for kw, loc in node.unsupported:
         applies = _UNSUPPORTED_KW_TYPES.get(kw)
         if applies is None or vt in applies:
             hits.append((kw, loc))
 
-    if vt == "object":
+    if not type_allows(node, vt, value):
+        errors.append(
+            f"{path or '#'}: 类型 {vt} 不被允许 {sorted(node.type or [])}")
+        return {"state": FAIL, "hits": [], "notes": [], "errors": errors}
+
+    if value is None:
+        # only unsupported keywords reachable for null (e.g. not, if/then)
+        return pending() if hits else \
+            {"state": PASS, "hits": hits, "notes": notes, "errors": errors}
+
+    local_errors = _facet_errors(node, value, path)
+    if local_errors:
+        return {"state": FAIL, "hits": [], "notes": [],
+                "errors": local_errors}
+
+    # recurse along the actual value; absent optional properties are skipped
+    if vt == "array" and node.items is not None and depth < MAX_DEPTH:
+        for i, item in enumerate(value):
+            sub = coverage_verdict(node.items, item, f"{path}/{i}", depth + 1)
+            _merge_child(sub, hits, notes, errors)
+
+    if vt == "object" and depth < MAX_DEPTH:
         for pname, pnode in node.properties.items():
             if pname in value:
-                hits.extend(unsupported_along_value(
-                    pnode, value[pname], depth + 1))
+                sub = coverage_verdict(
+                    pnode, value[pname], f"{path}/{_esc(pname)}", depth + 1)
+                _merge_child(sub, hits, notes, errors)
         if isinstance(node.additional, SchemaNode):
             extra = [k for k in value if k not in node.properties]
             for k in sorted(extra):
-                hits.extend(unsupported_along_value(
-                    node.additional, value[k], depth + 1))
-    elif vt == "array" and node.items is not None:
-        for item in value:
-            hits.extend(unsupported_along_value(node.items, item, depth + 1))
+                sub = coverage_verdict(
+                    node.additional, value[k], f"{path}/{_esc(k)}", depth + 1)
+                _merge_child(sub, hits, notes, errors)
 
-    for branches in (node.one_of, node.any_of):
-        if not branches:
-            continue
-        passing = [b for b in branches if not validate(b, value)]
-        if not passing:
-            continue  # validate() already flags the mismatch for objects
-        per_branch = [unsupported_along_value(b, value, depth + 1)
-                      for b in passing]
-        if all(per_branch):  # every passing branch rests on unsupported rules
-            for branch_hits in per_branch:
-                hits.extend(branch_hits)
-    return hits
+    # node-level properties/items are ANDed with any composition: a known
+    # violation already settles the verdict before branches are adjudicated
+    if errors:
+        return {"state": FAIL, "hits": [], "notes": [], "errors": errors}
+
+    # compositions: exact tri-state adjudication (all JSON types)
+    if depth < MAX_DEPTH:
+        if node.one_of:
+            comp = _composition_verdict(node.one_of, value, path, depth,
+                                        "oneOf")
+            hits.extend(comp["hits"])
+            notes.extend(comp["notes"])
+            errors.extend(comp["errors"])
+            if comp["state"] == FAIL:
+                return {"state": FAIL, "hits": [], "notes": [],
+                        "errors": comp["errors"]}
+            if comp["state"] == PENDING:
+                return pending()
+        if node.any_of:
+            comp = _composition_verdict(node.any_of, value, path, depth,
+                                        "anyOf")
+            hits.extend(comp["hits"])
+            notes.extend(comp["notes"])
+            errors.extend(comp["errors"])
+            if comp["state"] == FAIL:
+                return {"state": FAIL, "hits": [], "notes": [],
+                        "errors": comp["errors"]}
+            if comp["state"] == PENDING:
+                return pending()
+
+    if errors:
+        return {"state": FAIL, "hits": [], "notes": [], "errors": errors}
+    if hits or notes:
+        return pending()
+    return {"state": PASS, "hits": hits, "notes": notes, "errors": errors}
+
+
+def _merge_child(sub: dict, hits: list, notes: list, errors: list) -> None:
+    """Fold a child verdict (properties / items) into the parent buckets."""
+    if sub["state"] == FAIL:
+        errors.extend(sub["errors"])
+        return
+    hits.extend(sub["hits"])
+    notes.extend(sub["notes"])
+
+
+def _composition_verdict(branches: list, value: Any, path: str, depth: int,
+                         keyword: str) -> dict:
+    """Adjudicate one ``oneOf`` / ``anyOf`` site from per-branch states."""
+    results = [coverage_verdict(b, value, path, depth + 1)
+               for b in branches]
+    n_pass = sum(1 for r in results if r["state"] == PASS)
+    pending_results = [r for r in results if r["state"] == PENDING]
+    fail_results = [r for r in results if r["state"] == FAIL]
+    here = path or "#"
+
+    hits: list = []
+    notes: list = []
+    errors: list[str] = []
+
+    if keyword == "oneOf" and n_pass >= 2:
+        errors.append(
+            f"{here}: oneOf 要求恰好一个分支通过，但有 {n_pass} 个分支"
+            "（按已知约束）确定通过")
+        return {"state": FAIL, "hits": [], "notes": [], "errors": errors}
+
+    if keyword == "anyOf" and n_pass >= 1:
+        return {"state": PASS, "hits": [], "notes": [], "errors": errors}
+
+    if keyword == "oneOf" and n_pass == 1 and not pending_results:
+        return {"state": PASS, "hits": [], "notes": [], "errors": errors}
+
+    # no clean pass settles the site: pending branches keep it undecided
+    if pending_results:
+        if keyword == "oneOf":
+            if n_pass == 1:
+                notes.append((
+                    f"oneOf 已有一个分支确定通过，另有 {len(pending_results)} 个"
+                    "分支仍可能通过，是否「恰好一个」无法判定", None))
+            else:
+                notes.append((
+                    f"oneOf 无确定通过分支，{len(pending_results)} 个分支"
+                    "仍可能通过，是否「恰好一个」无法判定", None))
+        else:
+            notes.append((
+                f"anyOf 无确定通过分支，{len(pending_results)} 个分支"
+                "仍可能通过，是否「至少一个」无法判定", None))
+        for i, r in enumerate(results):
+            if r["state"] != PENDING:
+                continue
+            hits.extend(r["hits"])
+            for text, loc in r["notes"]:
+                notes.append((f"分支 {i}: {text}", loc))
+        return {"state": PENDING, "hits": hits, "notes": notes,
+                "errors": errors}
+
+    # every branch deterministically fails
+    if keyword == "oneOf" and n_pass <= 1:
+        errors.append(
+            f"{here}: oneOf 的 {len(fail_results)} 个分支均确定不通过")
+    else:
+        errors.append(
+            f"{here}: anyOf 的 {len(fail_results)} 个分支均确定不通过")
+    for r in fail_results[:1]:
+        errors.extend(r["errors"][:2])
+    return {"state": FAIL, "hits": [], "notes": [], "errors": errors}
 
 
 def minimal_instance(node: SchemaNode, depth: int = 0,

@@ -504,6 +504,185 @@ def test_unsupported_keyword_not_keyword_any_type(client):
     assert doc["summary"]["cells_covered"] == 0
 
 
+# ==================================================== oneOf / anyOf 三态裁决
+def _combo_op(schema):
+    return {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}
+
+
+def _combo_row(body):
+    return {"method": "POST", "path": "/p",
+            "request": {"media_type": "application/json", "body": body},
+            "response": {"status": 200}}
+
+
+def test_oneof_one_pass_one_pending_is_undetermined(client):
+    """一个分支干净通过、另一分支含 pattern 仍可能通过 → 无法判定不计格。"""
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^x"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "a", "v": "abc"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert row["cell"] is None
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+    # 列出待定关键字及其分支位置
+    assert any("pattern" in x and "oneOf/1" in x for x in row["reasons"])
+    # 说明 oneOf「恰好一个」无法判定
+    assert any("恰好一个" in x for x in row["reasons"])
+
+
+def test_anyof_one_pass_one_pending_is_covered(client):
+    """相同条件下 anyOf 有一个干净分支通过即可覆盖。"""
+    schema = {"anyOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^x"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "a", "v": "abc"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_oneof_two_deterministically_passing_fails(client):
+    """两个分支都按已知约束确定通过 → 违反「恰好一个」→ 校验失败。"""
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}}},
+        {"type": "object",
+         "properties": {"extra": {"type": "string"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "a", "extra": "x"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "validation_failed"
+    assert any("恰好一个" in x and "2 个分支" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_validation_failed"] == 1
+
+
+def test_oneof_exactly_one_clean_pass_is_covered(client):
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "b"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "a"})]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_oneof_zero_pass_with_pending_is_undetermined(client):
+    """无任何确定通过分支，但有含未支持约束的待定分支 → 无法判定。"""
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind", "v"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^x"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "b"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "a", "v": "nope"})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x for x in row["reasons"])
+
+
+def test_oneof_and_anyof_all_branches_fail(client):
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "b"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "z"})]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+
+    schema["anyOf"] = schema.pop("oneOf")
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"kind": "z"})]).json()
+    assert doc["rows"][0]["outcome"] == "validation_failed"
+
+
+def test_anyof_two_clean_passes_is_covered(client):
+    """anyOf 允许多个分支同时通过。"""
+    schema = {"anyOf": [
+        {"type": "object", "properties": {"a": {"type": "string"}}},
+        {"type": "object", "properties": {"b": {"type": "string"}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"a": "x", "b": "y"})]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+
+
+def test_oneof_pending_reported_in_response_body_too(client):
+    """响应体中的 oneOf 误报同样修复：状态码仍归属，行不计格。"""
+    schema = {"oneOf": [
+        {"type": "object", "required": ["k"],
+         "properties": {"k": {"const": "a"}}},
+        {"type": "object", "required": ["k"],
+         "properties": {"k": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^x"}}}]}
+    spec = _spec({"/p": {"get": {"responses": {"200": {"description": "d",
+        "content": {"application/json": {"schema": schema}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"k": "a", "v": "abc"}}}]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert row["status"] == "200"          # 状态码归属保留
+    assert row["cell"] is None
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_nested_oneof_pending_lists_inner_keyword_location(client):
+    """嵌套组合中的待定关键字位置逐层带出。"""
+    schema = {"oneOf": [
+        {"type": "object", "required": ["k"],
+         "properties": {"k": {"const": "a"}}},
+        {"type": "object", "required": ["k"],
+         "properties": {"k": {"const": "a"}, "inner": {"oneOf": [
+             {"type": "object", "required": ["t"],
+              "properties": {"t": {"const": "x"}}},
+             {"type": "object", "required": ["t"],
+              "properties": {"t": {"const": "x"},
+                             "s": {"type": "string", "pattern": "^z"}}}]}}}]}
+    aid = _analysis_from_docs(
+        client, _spec({"/p": {"post": _combo_op(schema)}}))
+    doc = _upload(client, aid, "baseline",
+                  [_combo_row({"k": "a",
+                               "inner": {"t": "x", "s": "nope"}})]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x and "inner" in x and "oneOf" in x
+               for x in row["reasons"])
+
+
 # ============================================================== HTTP surface
 def test_coverage_404_unknown_analysis(client):
     r = _upload(client, "nope", "baseline", [
