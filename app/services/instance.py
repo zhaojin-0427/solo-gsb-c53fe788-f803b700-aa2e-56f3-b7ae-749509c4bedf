@@ -150,13 +150,23 @@ def validate(node: SchemaNode, value: Any, path: str = "",
                 errors.extend(validate(node.additional, v,
                                        f"{path}/{_esc(k)}", depth + 1))
 
-    if vt in ("object",) and node.one_of and depth < MAX_DEPTH:
-        if not any(not validate(b, value, path, depth + 1)
-                   for b in node.one_of):
+    # 组合分支按三态裁决（确定通过 / 确定失败 / 待定）：oneOf 要求
+    # **恰好一个**分支确定通过——两个确定通过即校验失败；anyOf 要求
+    # **至少一个**。存在待定分支时此处不下定论（校验既未确定失败），
+    # 由 unsupported_along_value 沿值上报待定关键字与位置。
+    if node.one_of and depth < MAX_DEPTH:
+        verdicts = _branch_verdicts(node.one_of, value, path, depth)
+        n_pass = verdicts.count(_BRANCH_PASS)
+        if n_pass >= 2:
+            errors.append(
+                f"{path or '#'}: 同时满足 oneOf 的 {n_pass} 个分支"
+                "（要求恰好一个）")
+        elif n_pass == 0 and _BRANCH_UNDECIDED not in verdicts:
             errors.append(f"{path or '#'}: 不满足 oneOf 的任何分支")
-    if vt in ("object",) and node.any_of and depth < MAX_DEPTH:
-        if not any(not validate(b, value, path, depth + 1)
-                   for b in node.any_of):
+    if node.any_of and depth < MAX_DEPTH:
+        verdicts = _branch_verdicts(node.any_of, value, path, depth)
+        if _BRANCH_PASS not in verdicts and \
+                _BRANCH_UNDECIDED not in verdicts:
             errors.append(f"{path or '#'}: 不满足 anyOf 的任何分支")
     return errors
 
@@ -189,9 +199,11 @@ def unsupported_along_value(node: SchemaNode, value: Any,
     every unsupported keyword the value's verdict still depends on. Optional
     properties absent from the value are not visited, and keywords that do
     not apply to the value's JSON type (e.g. ``pattern`` for an integer) are
-    ignored. For compositions the hits propagate only when *every* branch the
-    value passes relies on unsupported constraints; a single cleanly
-    validated branch makes the verdict solid.
+    ignored. Compositions are adjudicated per branch state
+    （确定通过 / 确定失败 / 待定）: for ``oneOf`` a single cleanly passing
+    branch only settles the verdict when every other branch definitely
+    fails — a sibling that may still pass (``pattern`` …) keeps the row
+    undetermined; for ``anyOf`` one cleanly passing branch is enough.
     """
     hits: list = []
     if node is None or depth >= MAX_DEPTH:
@@ -219,17 +231,101 @@ def unsupported_along_value(node: SchemaNode, value: Any,
         for item in value:
             hits.extend(unsupported_along_value(node.items, item, depth + 1))
 
+    # oneOf「恰好一个」：一个分支确定通过时，任何仍可能通过的待定分支
+    # 都让整体无法判定（它若也通过就违反恰好一个）；没有确定通过时，
+    # 整体能否通过同样取决于待定分支。两个确定通过属于校验失败，
+    # 由 validate 报告，这里不再重复列举。
+    if node.one_of and depth < MAX_DEPTH:
+        verdicts = _branch_verdicts(node.one_of, value, "", depth)
+        if verdicts.count(_BRANCH_PASS) <= 1:
+            for branch, verdict in zip(node.one_of, verdicts):
+                if verdict == _BRANCH_UNDECIDED:
+                    hits.extend(_pending_hits(branch, value, depth + 1))
+    # anyOf「至少一个」：已有一个确定通过即覆盖（其余分支待定不影响
+    # 结论）；否则整体能否通过取决于待定分支。
+    if node.any_of and depth < MAX_DEPTH:
+        verdicts = _branch_verdicts(node.any_of, value, "", depth)
+        if _BRANCH_PASS not in verdicts:
+            for branch, verdict in zip(node.any_of, verdicts):
+                if verdict == _BRANCH_UNDECIDED:
+                    hits.extend(_pending_hits(branch, value, depth + 1))
+    return hits
+
+
+# ============================================================ branch verdicts
+# 组合分支（oneOf / anyOf）相对某个实际取值的三态裁决。
+_BRANCH_PASS = "pass"              # 确定通过：已知约束全过且无待定因素
+_BRANCH_FAIL = "fail"              # 确定失败：已支持约束已经失败
+_BRANCH_UNDECIDED = "undecided"    # 待定：通过与否仍依赖未支持/不可判定约束
+
+
+def _branch_verdicts(branches, value, path: str, depth: int) -> list:
+    """Classify each combinator branch for ``value`` into the three states.
+
+    * 确定失败：已支持（可判定）约束已经失败——未支持或不可判定的约束
+      只会更严格，不可能让分支重新通过；
+    * 待定：已知约束全过，但通过与否仍依赖 ``pattern`` 等未支持关键字，
+      或取值触达了循环引用 / 无法解析的节点；
+    * 确定通过：已知约束全过且没有任何待定因素。
+    """
+    verdicts: list = []
+    for b in branches:
+        if _undecidable_along_value(b, value, depth + 1):
+            verdicts.append(_BRANCH_UNDECIDED)
+        elif validate(b, value, path, depth + 1):
+            verdicts.append(_BRANCH_FAIL)
+        elif unsupported_along_value(b, value, depth + 1):
+            verdicts.append(_BRANCH_UNDECIDED)
+        else:
+            verdicts.append(_BRANCH_PASS)
+    return verdicts
+
+
+def _pending_hits(node: SchemaNode, value: Any, depth: int) -> list:
+    """待定分支需要列出的原因：未支持关键字，以及循环/不可判定节点位置。"""
+    hits = unsupported_along_value(node, value, depth)
+    hits.extend(_undecidable_along_value(node, value, depth))
+    return hits
+
+
+def _undecidable_along_value(node: SchemaNode, value: Any,
+                             depth: int = 0) -> list:
+    """Nodes along ``value`` whose constraints cannot be decided at all.
+
+    :func:`unsupported_along_value` reports unsupported *keywords*; this
+    walk covers the harder undecidable cases — reference cycles and
+    invalid / unresolvable schemas — so that a combinator branch touching
+    them is treated as 待定 instead of being optimistically counted as
+    确定通过. Untouched optional properties are not visited.
+    """
+    hits: list = []
+    if node is None or depth >= MAX_DEPTH:
+        return hits
+    if node.is_cycle:
+        hits.append(("循环引用", node.loc))
+        return hits
+    if node.invalid:
+        hits.append(("模式不可判定", node.loc))
+        return hits
+    if node.is_bool is not None:
+        return hits
+    vt = _json_type(value)
+    if vt == "object":
+        for pname, pnode in node.properties.items():
+            if pname in value:
+                hits.extend(_undecidable_along_value(
+                    pnode, value[pname], depth + 1))
+        if isinstance(node.additional, SchemaNode):
+            for k in sorted(k for k in value if k not in node.properties):
+                hits.extend(_undecidable_along_value(
+                    node.additional, value[k], depth + 1))
+    elif vt == "array" and node.items is not None:
+        for item in value:
+            hits.extend(_undecidable_along_value(node.items, item,
+                                                 depth + 1))
     for branches in (node.one_of, node.any_of):
-        if not branches:
-            continue
-        passing = [b for b in branches if not validate(b, value)]
-        if not passing:
-            continue  # validate() already flags the mismatch for objects
-        per_branch = [unsupported_along_value(b, value, depth + 1)
-                      for b in passing]
-        if all(per_branch):  # every passing branch rests on unsupported rules
-            for branch_hits in per_branch:
-                hits.extend(branch_hits)
+        for b in branches:
+            hits.extend(_undecidable_along_value(b, value, depth + 1))
     return hits
 
 

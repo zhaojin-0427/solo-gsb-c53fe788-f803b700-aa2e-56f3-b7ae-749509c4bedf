@@ -446,6 +446,125 @@ def test_unsupported_keyword_in_oneof_branch(client):
     assert doc["rows"][1]["outcome"] == "covered"
 
 
+# ============================================================== 组合分支三态裁决
+def _branch_spec(kind):
+    """一个分支确定通过、另一个含 pattern 仍可能通过的组合 schema。"""
+    schema = {kind: [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}, "v": {"type": "string"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "pattern": "^a"}}},
+    ]}
+    return _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+
+
+def _branch_call():
+    return {"method": "POST", "path": "/p",
+            "request": {"media_type": "application/json",
+                        "body": {"kind": "a", "v": "abc"}},
+            "response": {"status": 200}}
+
+
+def test_oneof_pass_plus_pending_branch_is_undetermined(client):
+    # oneOf「恰好一个」：一分支确定通过 + 一分支仍可能通过 → 无法判定
+    aid = _analysis_from_docs(client, _branch_spec("oneOf"))
+    doc = _upload(client, aid, "baseline", [_branch_call()]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    # 列出待定关键字及位置（第二个分支里的 pattern）
+    assert any("pattern" in x and "oneOf/1" in x for x in row["reasons"])
+    # 不计覆盖格
+    assert doc["summary"]["cells_covered"] == 0
+    assert doc["summary"]["calls_undetermined"] == 1
+    op = doc["operations"][0]
+    assert {c["key"] for c in op["gaps"]} == {"200|(no content)"}
+    # 保存后的确定性导出给出同一逐行结论与缺口
+    exported = json.loads(client.get(
+        f"/api/analyses/{aid}/coverage/baseline/export").content)
+    assert exported["rows"] == doc["rows"]
+    assert exported["summary"] == doc["summary"]
+    assert exported["operations"] == doc["operations"]
+
+
+def test_anyof_pass_plus_pending_branch_is_covered(client):
+    # anyOf「至少一个」：相同条件下一个确定通过即可覆盖
+    aid = _analysis_from_docs(client, _branch_spec("anyOf"))
+    doc = _upload(client, aid, "baseline", [_branch_call()]).json()
+    assert doc["rows"][0]["outcome"] == "covered"
+    assert doc["summary"]["cells_covered"] == 1
+
+
+def test_oneof_two_definite_passes_fail_validation(client):
+    # oneOf「恰好一个」：两个分支都确定通过 → 校验失败
+    schema = {"oneOf": [
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"}, "v": {"type": "string"}}},
+        {"type": "object", "required": ["kind"],
+         "properties": {"kind": {"const": "a"},
+                        "v": {"type": "string", "minLength": 1}}},
+    ]}
+    spec = _spec({"/p": {"post": {
+        "requestBody": {"content": {"application/json": {"schema": schema}}},
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [_branch_call()]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "validation_failed"
+    assert any("恰好一个" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_oneof_pending_branch_in_response_body(client):
+    # 响应体中的 oneOf 同样按三态裁决
+    schema = {"oneOf": [
+        {"type": "object", "required": ["id"],
+         "properties": {"id": {"type": "integer"}}},
+        {"type": "object", "required": ["id"],
+         "properties": {"id": {"type": "integer"},
+                        "code": {"type": "string", "pattern": "^[A-Z]+$"}}},
+    ]}
+    spec = _spec({"/p": {"get": {"responses": {"200": {"description": "d",
+        "content": {"application/json": {"schema": schema}}}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        # 触达待定分支的 pattern → 无法判定
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"id": 1, "code": "ABC"}}},
+        # 未触达可选属性 code → 两个分支都确定通过 → 校验失败
+        {"method": "GET", "path": "/p",
+         "response": {"status": 200, "media_type": "application/json",
+                      "body": {"id": 1}}},
+    ]).json()
+    assert doc["rows"][0]["outcome"] == "undetermined"
+    assert any("pattern" in x and "oneOf/1" in x
+               for x in doc["rows"][0]["reasons"])
+    assert doc["rows"][1]["outcome"] == "validation_failed"
+    assert doc["summary"]["cells_covered"] == 0
+
+
+def test_oneof_pending_branch_in_parameter(client):
+    # 查询参数的 oneOf 同样按三态裁决
+    spec = _spec({"/p": {"get": {"parameters": [
+        {"name": "q", "in": "query",
+         "schema": {"oneOf": [
+             {"type": "string"},
+             {"type": "string", "pattern": "^a"}]}}],
+        "responses": {"200": {"description": "d"}}}}})
+    aid = _analysis_from_docs(client, spec)
+    doc = _upload(client, aid, "baseline", [
+        {"method": "GET", "path": "/p", "query": {"q": "abc"},
+         "response": {"status": 200}},
+    ]).json()
+    row = doc["rows"][0]
+    assert row["outcome"] == "undetermined"
+    assert any("pattern" in x and "oneOf/1" in x for x in row["reasons"])
+    assert doc["summary"]["cells_covered"] == 0
+
+
 def test_unsupported_keyword_in_additional_properties(client):
     spec = _spec({"/p": {"post": {
         "requestBody": {"content": {"application/json": {"schema": {
